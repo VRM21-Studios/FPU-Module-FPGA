@@ -1,4 +1,4 @@
-# VRM21-FPU-Series
+# FPU Module FPGA
 
 **64-bit IEEE 754 Floating-Point Hardware Accelerator for FPGA**
 
