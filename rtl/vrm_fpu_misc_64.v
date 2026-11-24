@@ -1,28 +1,28 @@
+// ============================================================================
+// VRM21 Studios - FPU-Module-FPGA
+// ============================================================================
+// MODULE: vrm_fpu_misc_64
+// DESCRIPTION:
+//   Comparison, minimum/maximum and classification of IEEE 754 binary64
+//   values (lane F), with the semantics of the RISC-V F/D extension.
+//   misc_op: 0 FEQ, 1 FLT, 2 FLE, 3 FMIN, 4 FMAX, 5 FCLASS.
+//
+// Features:
+//   - FEQ/FLT/FLE return 0 or 1 in bit 0; +0 and -0 compare equal; any NaN
+//     compares false. FEQ raises NV only for a signaling NaN, FLT and FLE
+//     for any NaN.
+//   - FMIN/FMAX return the other operand when one input is NaN and the
+//     canonical quiet NaN when both are; a signaling NaN raises NV.
+//     FMIN(-0, +0) = -0 and FMAX(-0, +0) = +0 in either order.
+//   - FCLASS returns a one-hot mask in bits [9:0] (bit 0 -Inf ... bit 9
+//     quiet NaN) and never raises a flag.
+//
+// Notes:
+//   - rm is ignored; every encoding is accepted.
+//   - One registered stage, II = 1: an input sampled at clock edge n has a
+//     valid result right after edge n.
+// ============================================================================
 `timescale 1ns / 1ps
-
-/* ============================================================================
- * MODULE: vrm_fpu_misc_64 (LANE F: COMPARISON & CLASSIFICATION)
- * DESCRIPTION:
- *   Implements miscellaneous IEEE 754 / RISC-V RV32D floating-point
- *   operations:
- *     - FEQ : Floating-Point Equal
- *     - FLT : Floating-Point Less Than
- *     - FLE : Floating-Point Less Than or Equal
- *     - FMIN: Floating-Point Minimum
- *     - FMAX: Floating-Point Maximum
- *     - FCLASS: Floating-Point Classification
- *
- * LATENCY:
- *   1 cycle
- *
- * OPERATION SELECT:
- *   3'b000 : FEQ
- *   3'b001 : FLT
- *   3'b010 : FLE
- *   3'b011 : FMIN
- *   3'b100 : FMAX
- *   3'b101 : FCLASS
- * ============================================================================ */
 
 module vrm_fpu_misc_64 (
     input  wire        clk,
@@ -34,7 +34,9 @@ module vrm_fpu_misc_64 (
     input  wire [63:0] op_b,
     
     output reg  [63:0] result_out,
-    output reg         valid_out
+    output reg         valid_out,
+    input wire [2:0] rm,
+    output reg [4:0] fflags_out
 );
 
     // =========================================================================
@@ -105,6 +107,7 @@ module vrm_fpu_misc_64 (
     end
 
     wire le = lt || eq;
+    wire any_snan=(nan_a && !op_a[51]) || (nan_b && !op_b[51]);
 
     // =========================================================================
     // 3. FCLASS LOGIC
@@ -112,8 +115,8 @@ module vrm_fpu_misc_64 (
     // Generate the IEEE 754 10-bit classification mask.
     //
     // Bit mapping follows the RISC-V FCLASS encoding:
-    //   Bit 9 : Signaling NaN
-    //   Bit 8 : Quiet NaN
+    //   Bit 9 : Quiet NaN
+    //   Bit 8 : Signaling NaN
     //   Bit 7 : +Infinity
     //   Bit 6 : +Normal
     //   Bit 5 : +Subnormal
@@ -127,12 +130,12 @@ module vrm_fpu_misc_64 (
         nan_a && (op_a[51]),                         // Quiet NaN
         nan_a && (!op_a[51]),                        // Signaling NaN
         !s_a && inf_a,                               // +Infinity
-        !s_a && !inf_a && !sub_a && !z_a,            // +Normal
+        !s_a && !nan_a && !inf_a && !sub_a && !z_a,            // +Normal
         !s_a && sub_a,                               // +Subnormal
         !s_a && z_a,                                 // +Zero
         s_a && z_a,                                  // -Zero
         s_a && sub_a,                                // -Subnormal
-        s_a && !inf_a && !sub_a && !z_a,             // -Normal
+        s_a && !nan_a && !inf_a && !sub_a && !z_a,             // -Normal
         s_a && inf_a                                 // -Infinity
     };
 
@@ -146,16 +149,22 @@ module vrm_fpu_misc_64 (
     always @(posedge clk) begin
         if (!rstn) begin
             valid_out  <= 1'b0;
+            fflags_out <= 5'd0;
             result_out <= 64'd0;
         end else begin
             valid_out <= valid_in;
+            case(misc_op)
+                3'd0,3'd3,3'd4: fflags_out<={any_snan,4'd0};
+                3'd1,3'd2: fflags_out<={(nan_a || nan_b),4'd0};
+                default: fflags_out<=5'd0;
+            endcase
 
             case (misc_op)
                 3'b000: result_out <= {63'd0, eq};                                  // FEQ
                 3'b001: result_out <= {63'd0, lt};                                  // FLT
                 3'b010: result_out <= {63'd0, le};                                  // FLE
-                3'b011: result_out <= (lt || (z_a && z_b && s_a)) ? op_a : op_b;    // FMIN
-                3'b100: result_out <= (lt || (z_a && z_b && s_a)) ? op_b : op_a;    // FMAX
+                3'b011: result_out <= (nan_a && nan_b) ? 64'h7ff8000000000000 : nan_a ? op_b : nan_b ? op_a : (lt || (z_a && z_b && s_a)) ? op_a : op_b;    // FMIN
+                3'b100: result_out <= (nan_a && nan_b) ? 64'h7ff8000000000000 : nan_a ? op_b : nan_b ? op_a : (lt || (z_a && z_b && s_a)) ? op_b : op_a;    // FMAX
                 3'b101: result_out <= {54'd0, class_mask_a};                        // FCLASS
                 default: result_out <= 64'd0;
             endcase
@@ -163,3 +172,4 @@ module vrm_fpu_misc_64 (
     end
 
 endmodule
+

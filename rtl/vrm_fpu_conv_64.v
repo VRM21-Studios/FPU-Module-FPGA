@@ -1,237 +1,114 @@
-`timescale 1ns / 1ps
-
-/* ============================================================================
- * MODULE: vrm_fpu_conv_64
- * LANE E: CONVERSION UNIT
- *
- * DESCRIPTION:
- * Conversion unit between 32-bit integers and IEEE 754 double-precision
- * floating-point values for the RV32D FPU.
- *
- * Supported operations:
- *   00 : I2D  - Signed Integer 32-bit to Double 64-bit
- *   01 : UI2D - Unsigned Integer 32-bit to Double 64-bit
- *   10 : D2I  - Double 64-bit to Signed Integer 32-bit
- *   11 : D2UI - Double 64-bit to Unsigned Integer 32-bit
- *
- * The unit is implemented as a two-stage pipeline:
- *   Stage 1 : Operand analysis and alignment
- *   Stage 2 : Final conversion and output packing
- *
- * Fixed-width extensions are explicitly used in several expressions to
- * prevent truncation and width-mismatch warnings in Verilator.
- * ============================================================================ */
-
+// ============================================================================
+// VRM21 Studios - FPU-Module-FPGA
+// ============================================================================
+// MODULE: vrm_fpu_conv_64
+// DESCRIPTION:
+//   Conversion between 32-bit integers and IEEE 754 binary64 (lane E).
+//   conv_op: 0 int32 to binary64, 1 uint32 to binary64, 2 binary64 to
+//   int32, 3 binary64 to uint32.
+//
+// Features:
+//   - Integer input is taken from op_a[31:0]; integer results are returned
+//     in result_out[31:0] with bits [63:32] zero, for signed and unsigned.
+//   - int32/uint32 to binary64 is always exact (flags zero).
+//   - binary64 to integer rounds with rm first, then checks the range of
+//     the rounded value. NaN, infinity or an out-of-range result raises NV
+//     only (NX suppressed) and returns 7fffffff / 80000000 (int32) or
+//     ffffffff / 00000000 (uint32).
+//
+// Notes:
+//   - Two registered stages, II = 1. An input sampled at clock edge n has a
+//     valid result after edge n+1.
+// ============================================================================
+`timescale 1ns/1ps
 module vrm_fpu_conv_64 (
-    input  wire        clk,
-    input  wire        rstn,
-    
-    input  wire        valid_in,
-    input  wire [1:0]  conv_op,    // 00: I2D, 01: UI2D, 10: D2I, 11: D2UI
-    input  wire [63:0] op_a,       // 64-bit FP value or 32-bit integer in [31:0]
-    
-    output reg  [63:0] result_out,
-    output reg         valid_out
+    input wire clk,input wire rstn,input wire valid_in,
+    input wire [1:0] conv_op,input wire [63:0] op_a,
+    output reg [63:0] result_out,output reg valid_out,
+    input wire [2:0] rm,output reg [4:0] fflags_out
 );
-
-    // =========================================================================
-    // STAGE 1: OPERAND ANALYSIS & ALIGNMENT
-    // =========================================================================
-    
-    // -------------------------------------------------------------------------
-    // Integer-to-Double Conversion Path
-    // -------------------------------------------------------------------------
-    
-    // Extract the 32-bit integer input.
-    wire [31:0] int_in = op_a[31:0];
-
-    // Determine the integer sign.
-    // Signed conversion uses bit 31 as the sign bit.
-    // Unsigned conversion always uses a positive sign.
-    wire        int_sign = conv_op[0] ? 1'b0 : int_in[31];
-
-    // Convert the input integer to its absolute magnitude.
-    wire [31:0] int_abs  = (int_sign) ? (~int_in + 1) : int_in;
-    
-    // -------------------------------------------------------------------------
-    // Integer Leading-Zero / Leading-One Position Detection
-    // -------------------------------------------------------------------------
-    
-    // The leading-zero count is used to determine the normalized exponent
-    // and mantissa position during Integer-to-Double conversion.
-    reg [4:0] lzc_int;
-    integer i;
-
-    always @(*) begin
-        lzc_int = 5'd31;
-
-        for (i = 0; i < 32; i = i + 1) begin
-            if (int_abs[i])
-                lzc_int = 5'd31 - i[4:0];
+    wire [10:0] raw_exp=op_a[62:52];
+    wire [51:0] fraction=op_a[51:0];
+    wire fp_sign=op_a[63];
+    wire nan_value=(raw_exp==11'h7ff) && (fraction!=52'd0);
+    wire int_sign=!conv_op[0] && op_a[31];
+    wire [31:0] magnitude=int_sign ? (~op_a[31:0]+32'd1) : op_a[31:0];
+    reg [5:0] msb;
+    reg [63:0] scaled,mantissa,integer_magnitude;
+    reg signed [13:0] exponent,shift_distance;
+    reg [6:0] distance;
+    reg guard_bit,sticky,inexact,increment,invalid;
+    reg [10:0] encoded_exp;
+    reg [31:0] integer_result;
+    reg [63:0] converted;
+    reg [4:0] flags;
+    integer j;
+    always @* begin
+        msb=6'd0;scaled=64'd0;encoded_exp=11'd0;flags=5'd0;
+        mantissa={11'd0,(raw_exp!=11'd0),fraction};
+        integer_magnitude=64'd0;integer_result=32'd0;
+        exponent=(raw_exp==11'd0) ? -14'sd1022 : ($signed({3'b000,raw_exp})-14'sd1023);
+        shift_distance=14'sd52-$signed(exponent);
+        distance=7'd0;guard_bit=1'b0;sticky=1'b0;converted=64'd0;
+        inexact=1'b0;increment=1'b0;invalid=1'b0;
+        if(!conv_op[1]) begin
+            for(j=0;j<32;j=j+1) if(magnitude[j]) msb=j[5:0];
+            scaled={32'd0,magnitude} << (6'd52-msb);
+            encoded_exp=11'd1023+{5'd0,msb};
+            if(magnitude!=32'd0) converted={int_sign,encoded_exp,scaled[51:0]};
+        end else begin
+            if($signed(exponent)<=14'sd31) begin
+                // Relevant shift range is [21,1074]; don't narrow before clamp.
+                if($signed(shift_distance)>14'sd64) begin
+                    sticky=|mantissa;
+                end else begin
+                    distance=shift_distance[6:0];
+                    integer_magnitude=mantissa >> distance;
+                    guard_bit=mantissa[distance-7'd1];
+                    for(j=0;j<64;j=j+1)
+                        if({1'b0,j[5:0]}<(distance-7'd1)) sticky=sticky | mantissa[j];
+                end
+                inexact=guard_bit || sticky;
+                case(rm)
+                    3'd0: increment=guard_bit && (sticky || integer_magnitude[0]);
+                    3'd1: increment=1'b0;
+                    3'd2: increment=fp_sign && inexact;
+                    3'd3: increment=!fp_sign && inexact;
+                    3'd4: increment=guard_bit;
+                    default: increment=1'b0;
+                endcase
+                integer_magnitude=integer_magnitude+{63'd0,increment};
+            end
+            if(nan_value) begin
+                integer_result=conv_op[0] ? 32'hffffffff : 32'h7fffffff;invalid=1'b1;
+            end else if(conv_op[0]) begin
+                if(fp_sign) begin
+                    integer_result=32'd0;
+                    invalid=($signed(exponent)>14'sd31) || (integer_magnitude!=64'd0);
+                end else if($signed(exponent)>14'sd31 || integer_magnitude>64'hffffffff) begin
+                    integer_result=32'hffffffff;invalid=1'b1;
+                end else integer_result=integer_magnitude[31:0];
+            end else if(fp_sign) begin
+                if($signed(exponent)>14'sd31 || integer_magnitude>64'h80000000) begin
+                    integer_result=32'h80000000;invalid=1'b1;
+                end else integer_result=~integer_magnitude[31:0]+32'd1;
+            end else begin
+                if($signed(exponent)>14'sd31 || integer_magnitude>64'h7fffffff) begin
+                    integer_result=32'h7fffffff;invalid=1'b1;
+                end else integer_result=integer_magnitude[31:0];
+            end
+            converted={32'd0,integer_result};
+            flags=invalid ? 5'b10000 : {4'd0,inexact};
         end
     end
-
-    // -------------------------------------------------------------------------
-    // Double-to-Integer Conversion Path
-    // -------------------------------------------------------------------------
-    
-    // Unpack the IEEE 754 double-precision operand.
-    wire        f_sign;
-    wire [10:0] f_exp;
-    wire [52:0] f_mant;
-    
-    vrm_fpu_unpacker_64 unpack_f2i (
-        .fp_in(op_a), 
-        .sign(f_sign), 
-        .exp(f_exp), 
-        .mantissa(f_mant), 
-        .is_zero(), 
-        .is_subnormal(), 
-        .is_inf(), 
-        .is_nan(), 
-        .is_snan(), 
-        .is_qnan()
-    );
-
-    // Calculate the shift amount required to convert the normalized
-    // floating-point mantissa into an integer representation.
-    //
-    // The exponent is biased by 1023. The additional offset accounts for
-    // the position of the implicit leading bit within the extended mantissa.
-    //
-    // If the exponent is sufficiently small, the resulting integer becomes
-    // zero after the right shift.
-    wire signed [12:0] shift_amt = 13'd1086 - {2'b0, f_exp};
-
-    // -------------------------------------------------------------------------
-    // Pipeline Registers: Stage 1 -> Stage 2
-    // -------------------------------------------------------------------------
-    
-    reg        s2_valid, s2_sign;
-    reg [1:0]  s2_op;
-    reg [31:0] s2_int_abs;
-    reg [4:0]  s2_lzc;
-    reg [63:0] s2_f_mant_ext;
-    reg signed [11:0] s2_shift;
-    reg        s2_f_sign;
-
+    reg v1;
+    reg [63:0] result1;
+    reg [4:0] flags1;
     always @(posedge clk) begin
-        if (!rstn) begin
-            s2_valid      <= 1'b0;
-            s2_op         <= 2'b00;
-            s2_sign       <= 1'b0;
-            s2_int_abs    <= 32'd0;
-            s2_lzc        <= 5'd0;
-            s2_f_mant_ext <= 64'd0;
-            s2_shift      <= 12'd0;
-            s2_f_sign     <= 1'b0;
-        end else begin
-            s2_valid      <= valid_in;
-            s2_op         <= conv_op;
-            s2_sign       <= int_sign;
-            s2_int_abs    <= int_abs;
-            s2_lzc        <= lzc_int;
-            s2_f_mant_ext <= {f_mant, 11'd0};
-            s2_shift      <= shift_amt;
-            s2_f_sign     <= f_sign;
+        if(!rstn) begin v1<=0;result1<=0;valid_out<=0;result_out<=0;flags1<=0;fflags_out<=0;end
+        else begin
+            v1<=valid_in;result1<=converted;flags1<=flags;
+            valid_out<=v1;result_out<=result1;fflags_out<=flags1;
         end
     end
-
-    // =========================================================================
-    // STAGE 2: FINAL CONVERSION & PACKING
-    // =========================================================================
-    
-    reg [63:0] res_i2d;
-    reg [63:0] res_d2i;
-    wire [63:0] shifted;
-    
-    // Convert the extended floating-point mantissa into an integer magnitude
-    // according to the calculated shift amount.
-    assign shifted = s2_f_mant_ext >> s2_shift;
-
-    always @(*) begin
-
-        // ---------------------------------------------------------------------
-        // Integer-to-Double (I2D / UI2D)
-        // ---------------------------------------------------------------------
-        
-        // Zero is handled directly as the IEEE 754 +0.0 representation.
-        if (s2_int_abs == 0) begin
-            res_i2d = 64'd0;
-        end else begin
-            res_i2d[63] = s2_sign;
-
-            // Calculate the IEEE 754 biased exponent.
-            // The explicit extension of s2_lzc prevents width ambiguity.
-            res_i2d[62:52] = 11'd1023 + (11'd31 - {6'b0, s2_lzc}); 
-
-            // Normalize the integer magnitude and place it into the
-            // 52-bit fraction field.
-            //
-            // Explicit 64-bit extension is used before shifting so that
-            // significant bits are not truncated during the operation.
-            res_i2d[51:0] = ({32'd0, s2_int_abs} << (s2_lzc + 1)) << 20; 
-        end
-
-        // ---------------------------------------------------------------------
-        // Double-to-Integer (D2I / D2UI)
-        // ---------------------------------------------------------------------
-        
-        // The floating-point value is smaller than one and therefore produces
-        // an integer value of zero.
-        if (s2_shift > 63) begin
-            res_d2i = 64'd0;
-
-        // The floating-point value exceeds the representable 32-bit range.
-        // Saturate the result to the corresponding signed boundary.
-        end else if (s2_shift < 32) begin
-            res_d2i = s2_f_sign ? {32'h0, 32'h80000000} :
-                                  {32'h0, 32'h7FFFFFFF};
-
-        end else begin
-
-            // Apply two's-complement conversion for negative results.
-            res_d2i[31:0] = s2_f_sign ? (~shifted[31:0] + 1) :
-                                         shifted[31:0];
-
-            res_d2i[63:32] = 32'd0;
-        end
-    end
-    
-    // =========================================================================
-    // FINAL OUTPUT REGISTER & OPERATION MUX
-    // =========================================================================
-    
-    always @(posedge clk) begin
-        if (!rstn) begin
-            valid_out  <= 1'b0;
-            result_out <= 64'd0;
-        end else begin
-            valid_out  <= s2_valid;
-
-            // conv_op[1] selects the conversion direction:
-            //   0 -> Integer to Double
-            //   1 -> Double to Integer
-            result_out <= (s2_op[1]) ? res_d2i : res_i2d;
-        end
-    end
-
-    // =========================================================================
-    // UNUSED SIGNAL SUPPRESSION
-    // =========================================================================
-    
-    // Explicitly reference signals that are intentionally unused by the
-    // current conversion datapath to keep Verilator lint output clean.
-    //
-    // conv_op[0] is already consumed during Stage 1 sign determination,
-    // but s2_op[0] is not otherwise required after the operation direction
-    // has been selected.
-    //
-    // The upper 32 bits of shifted are also intentionally unused because
-    // only the lower 32 bits are required by the current integer output path.
-    // verilator lint_off UNUSED
-    wire _unused_op0 = s2_op[0];
-    wire [31:0] _unused_shifted_high = shifted[63:32];
-    // verilator lint_on UNUSED
-
 endmodule

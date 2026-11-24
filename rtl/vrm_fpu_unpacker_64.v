@@ -1,5 +1,5 @@
-`timescale 1ns / 1ps
-
+// ============================================================================
+// VRM21 Studios - FPU-Module-FPGA
 // ============================================================================
 // MODULE: vrm_fpu_unpacker_64
 // DESCRIPTION:
@@ -26,6 +26,7 @@
 // - NaN classification uses the most-significant fraction bit to distinguish
 //   Signaling NaN from Quiet NaN.
 // ============================================================================
+`timescale 1ns / 1ps
 
 module vrm_fpu_unpacker_64 (
     input  wire [63:0] fp_in,
@@ -98,3 +99,4 @@ module vrm_fpu_unpacker_64 (
                                      {1'b1, raw_frac};
 
 endmodule
+

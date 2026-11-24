@@ -1,648 +1,101 @@
 # FPU Module FPGA
 
-**64-bit IEEE 754 Floating-Point Hardware Accelerator for FPGA**
+**Repository profile: B (multi-module streaming IP).** A pipelined IEEE 754 binary64 floating-point unit for FPGA, with an AXI4-Lite / AXI4-Stream wrapper, verified in simulation against Berkeley SoftFloat and run on a Kria KR260.
 
-`VRM21-FPU-Series` is a modular double-precision floating-point unit (FPU) implemented in Verilog/SystemVerilog and designed for FPGA-based hardware acceleration.
+## Overview
 
-The project provides a reusable FP64 computation architecture covering basic arithmetic, conversion, comparison, transcendental functions, and activation functions. The FPU is exposed through an AXI-based hardware interface and can be controlled from an embedded processor through AXI-Lite and AXI-Stream/DMA.
+This repository contains a double-precision (binary64) floating-point unit written in Verilog-2001 for AMD FPGAs. It provides correctly rounded addition, subtraction, multiplication, division and square root, conversions between binary64 and 32-bit integers, and the comparison, minimum/maximum and classification operations of the RISC-V F/D extension. Every rounding operation supports the five IEEE 754 rounding modes, and every result is returned together with its five IEEE 754 exception flags.
 
-The design has been verified through both **RTL simulation** and **FPGA hardware validation on a Kria KV260 platform**.
+Version 2 replaces the earlier version of this repository. The earlier design added transcendental and activation functions (LOG2, LN, EXP2, EXP, SIN, COS, SIGMOID, TANH) built from polynomial approximations, but its own characterization recorded wrong results for subnormal numbers, underflow and NaN cases in the basic arithmetic, and it had no rounding-mode selection or exception flags. Version 2 removes the approximated functions and concentrates on a core whose results are bit-exact with an IEEE 754 reference for the supported operations, including subnormal numbers, signed zeros, infinities, NaNs and exception flags. The earlier design remains available under the `v1.0.0` tag; see [CHANGELOG.md](CHANGELOG.md).
 
----
+The unit is a numerical building block. It is intended for hardware acceleration through a processor such as the Zynq UltraScale+ PS, and as the arithmetic core of a future RISC-V floating-point extension.
 
-## Motivation
+### Supported operations
 
-This project was developed as part of a broader self-directed study of computer architecture and processor datapath design.
+| OP | FUNCT3 | Operation | Result |
+| ---: | ---: | --- | --- |
+| 0 | - | ADD: A + B | binary64 |
+| 1 | - | SUB: A - B | binary64 |
+| 2 | - | MUL: A x B | binary64 |
+| 3 | - | DIV: A / B | binary64 |
+| 4 | - | SQRT: square root of A | binary64 |
+| 5 | 0 / 1 | int32 / uint32 to binary64 | binary64 |
+| 6 | 0 / 1 | binary64 to int32 / uint32 | 32-bit integer, zero-extended |
+| 7 | 0 / 1 / 2 | FEQ / FLT / FLE | 0 or 1 |
+| 7 | 3 / 4 | FMIN / FMAX | binary64 |
+| 7 | 5 | FCLASS | 10-bit one-hot class mask |
 
-Floating-point computation introduces challenges that are not present in conventional integer arithmetic, including numerical representation, normalization, rounding, special values, and complex arithmetic pipelines. The project provides a practical environment for exploring how these concepts are implemented in hardware and how a floating-point execution unit can be integrated into a processor-oriented architecture.
+Rounding modes (RM): 0 RNE (nearest, ties to even), 1 RTZ (toward zero), 2 RDN (toward negative infinity), 3 RUP (toward positive infinity), 4 RMM (nearest, ties away from zero). Flags: {NV, DZ, OF, UF, NX} = {invalid, divide by zero, overflow, underflow, inexact}.
 
----
-
-## Features
-
-* 64-bit IEEE 754 double-precision datapath
-* Modular FPU architecture
-* AXI-Lite control interface
-* AXI-Stream data interface
-* AXI DMA integration
-* FPGA hardware acceleration
-* Parameterized internal arithmetic modules
-* Support for basic floating-point operations
-* Integer ↔ FP64 conversion
-* Floating-point comparison and classification
-* Transcendental function approximation
-* Activation functions
-* Micro-operation based function composition
-
----
-
-## Supported Operations
-
-### Basic Arithmetic
-
-| Operation | Function |
-| --------- | -------- |
-| ADD       | `A + B`  |
-| SUB       | `A - B`  |
-| MUL       | `A × B`  |
-| DIV       | `A / B`  |
-| SQRT      | `√A`     |
-
-### Conversion and Comparison
-
-| Operation | Function                               |
-| --------- | -------------------------------------- |
-| I2F       | 32-bit signed integer → FP64           |
-| F2I       | FP64 → 32-bit signed integer           |
-| FEQ       | Floating-point equality                |
-| FLT       | Floating-point less-than               |
-| FLE       | Floating-point less-than-or-equal      |
-| FMIN      | Floating-point minimum                 |
-| FMAX      | Floating-point maximum                 |
-| FCLASS    | IEEE 754 floating-point classification |
-
-### Transcendental Functions
-
-| Operation | Function  |
-| --------- | --------- |
-| LOG2      | `log₂(x)` |
-| LN        | `ln(x)`   |
-| EXP2      | `2ˣ`      |
-| EXP       | `eˣ`      |
-| SIN       | `sin(x)`  |
-| COS       | `cos(x)`  |
-
-### Activation Functions
-
-| Operation | Function        |
-| --------- | --------------- |
-| SIGMOID   | `1 / (1 + e⁻ˣ)` |
-| TANH      | `tanh(x)`       |
-
-The transcendental and activation units use hardware-oriented numerical approximations rather than software library implementations.
-
----
-
-## Higher-Level Hardware Micro-Operations
-
-The FPU primitives can also be orchestrated into more complex mathematical functions.
-
-The current FPGA demonstration includes:
-
-```text
-POWER
-x^y = 2^(y × log2(x))
-
-TAN
-tan(x) = sin(x) / cos(x)
-
-LOG10
-log10(x) = ln(x) / ln(10)
-
-GELU
-GELU(x) ≈ 0.5 × x × (1 + tanh(√(2/π) × (x + 0.044715x³)))
-```
-
-These higher-level functions demonstrate that the individual FPU blocks can be composed into larger computational pipelines without requiring a dedicated hardware block for every mathematical operation.
-
----
+The unit implements a selected set of operations, not the complete IEEE 754 standard. Fused multiply-add, remainder, roundToIntegral, binary32 and 64-bit integer conversions are not provided. See [docs/limitations.md](docs/limitations.md).
 
 ## Architecture
 
-The design is organized as a collection of independent computational units.
+The design has three layers. Six independent, fully pipelined lanes perform the arithmetic: add/subtract, multiply, divide, square root, integer conversion, and compare/min/max/class. Each lane accepts a new operation every clock cycle. The dispatcher `vrm_fpu_native_64` sends each request to its lane and delays the faster lanes so that every operation takes exactly 56 clock edges; results therefore leave in issue order and never collide, and any mix of operations can be issued back to back. The AXI wrapper `vrm_fpu_axi_64` adds the AXI4-Lite register file, the AXI4-Stream packet format, and flow control that reserves an output slot for every admitted operation, so a stalled output stream never loses a result.
 
 ```text
-                         ┌──────────────────────┐
-                         │      AXI-Lite        │
-                         │   Control Registers  │
-                         └──────────┬───────────┘
-                                    │
-                                    ▼
-                         ┌──────────────────────┐
-                         │     VRM FPU AXI      │
-                         │     Control Core     │
-                         └──────────┬───────────┘
-                                    │
-                              AXI-Stream
-                                    │
-                                    ▼
-                    ┌──────────────────────────────┐
-                    │          FPU Core            │
-                    │                              │
-                    │  ┌────────┐  ┌────────────┐  │
-                    │  │  ADD   │  │    MUL     │  │
-                    │  └────────┘  └────────────┘  │
-                    │                              │
-                    │  ┌────────┐  ┌────────────┐  │
-                    │  │  DIV   │  │    SQRT    │  │
-                    │  └────────┘  └────────────┘  │
-                    │                              │
-                    │  ┌────────┐  ┌────────────┐  │
-                    │  │ CONV   │  │   MISC     │  │
-                    │  └────────┘  └────────────┘  │
-                    │                              │
-                    │  ┌────────────────────────┐  │
-                    │  │   Transcendental Unit  │  │
-                    │  │ LOG2 / LN / EXP2 / EXP │  │
-                    │  │ SIN / COS              │  │
-                    │  └────────────────────────┘  │
-                    │                              │
-                    │  ┌────────────────────────┐  │
-                    │  │   Activation Functions │  │
-                    │  │ SIGMOID / TANH         │  │
-                    │  └────────────────────────┘  │
-                    └──────────────┬───────────────┘
-                                   │
-                              AXI-Stream
-                                   │
-                                   ▼
-                              AXI DMA / PS
+              AXI4-Lite (control, flags, status)
+                         |
+ AXI4-Stream  +----------v-------------------------------------------+  AXI4-Stream
+ A, B+TLAST ->| vrm_fpu_axi_64                                       |-> result, flags+TLAST
+              |  request FIFO (64) -> vrm_fpu_native_64 -> result FIFO (64)
+              |                       |  A add/sub  2  + delay 54     |
+              |                       |  B mul      5  + delay 51     |
+              |                       |  C div     56                 |
+              |                       |  D sqrt    56                 |
+              |                       |  E conv     1  + delay 55     |
+              |                       |  F misc     0  + delay 56     |
+              +------------------------------------------------------+
 ```
 
-The transcendental functions are implemented by composing lower-level floating-point primitives such as multiplication and addition with polynomial approximation.
+Division and square root use restoring algorithms unrolled in space, one step per pipeline stage, so they also accept one operation per cycle. Subnormal operands are normalized before every arithmetic operation, and each result is rounded exactly once by a shared round-and-pack block that detects tininess after rounding.
 
-For more details, see:
+Details: [architecture](docs/architecture.md), [design rationale](docs/design_rationale.md), [latency and data format](docs/latency_and_data_format.md).
 
-* [`docs/architecture.md`](docs/architecture.md)
-* [`docs/module_overview.md`](docs/module_overview.md)
-* [`docs/interface.md`](docs/interface.md)
-* [`docs/numerical_implementation.md`](docs/numerical_implementation.md)
+## Interface
 
----
+- `aclk`, `aresetn`: single clock domain, active-low synchronous reset.
+- `s_axi_*`: AXI4-Lite slave, 8-bit address, 32-bit data. Register map in [docs/address_map.md](docs/address_map.md).
+- `s_axis_*`: 64-bit input stream. One operation is two beats: operand A, then operand B with TLAST. Unary operations ignore B.
+- `m_axis_*`: 64-bit output stream. One result is two beats: the result, then the flags in bits [4:0] with TLAST.
 
-## Numerical Implementation
+The operation (OP, FUNCT3, RM) is set through AXI4-Lite and captured with operand A. The packet rules, error handling and abort are described in [docs/streaming_contract.md](docs/streaming_contract.md).
 
-Several transcendental functions use polynomial approximation and Horner-form evaluation.
+## Simulation
 
-For example, the sine implementation follows the general structure:
+All testbenches are self-checking. Run the full regression with the AMD Vivado simulator (Vivado 2025.2 was used):
 
-```text
-x²
- │
- ▼
-Polynomial evaluation
- │
- ▼
-x × P(x²)
- │
- ▼
-sin(x)
+```powershell
+pwsh -File scripts/run_sim.ps1
+pwsh -File scripts/run_sim.ps1 -Test native,axi     # selected tests
 ```
 
-This structure allows the computation to be mapped onto reusable floating-point multiplier and adder units.
+The script compiles `rtl/*.v` as Verilog and `tb/*.sv` as SystemVerilog, runs 12 tests, writes logs to `build/sim/`, and exits with a non-zero code if any test fails. It finds Vivado through `-VivadoBin`, `scripts/local_settings.ps1` (not committed), `XILINX_VIVADO`, or the `PATH`. The test vectors are in `tb/mem/`. See [docs/verification.md](docs/verification.md).
 
-The same architectural concept is used for other transcendental functions.
+## Build
 
-Because these functions are approximations, their numerical accuracy depends on the approximation order, input range, floating-point implementation, and range-reduction strategy.
+`bd/vrm_fpu_bd.tcl` builds a Vivado block design for the Kria KR260 (Zynq UltraScale+ PS, AXI DMA in simple mode, the FPU as a module reference) and makes its HDL wrapper the top. Create an RTL project for part `xck26-sfvc784-2LV-c` with the KR260 board in Vivado 2025.2, then in the Tcl Console:
 
-Detailed implementation notes are available in:
-
-[`docs/numerical_implementation.md`](docs/numerical_implementation.md)
-
----
-
-# Verification
-
-The project has two levels of validation:
-
-```text
-                 VRM21-FPU-Series
-                        │
-             ┌──────────┴──────────┐
-             │                     │
-             ▼                     ▼
-      RTL Simulation         FPGA Validation
-             │                     │
-             ▼                     ▼
-       Verilog Testbench      Kria KV260
-             │                     │
-             ▼                     ▼
-       Functional Check      PYNQ + AXI DMA
+```tcl
+source <repository>/bd/vrm_fpu_bd.tcl
 ```
 
-## RTL Simulation
+Then run synthesis, implementation and bitstream generation. Clock, memory ports and address map are in [docs/build_overview.md](docs/build_overview.md).
 
-The AXI testbench validates the major FPU operation groups.
+## Validation Status
 
-The simulation baseline includes:
+**FPGA-validated** on a Kria KR260 at 100 MHz. One documented gap: the board run is linked to the published RTL by recorded source hashes rather than by a synthesis log. Evidence is in [docs/validation_notes.md](docs/validation_notes.md):
 
-* Basic arithmetic
-* Integer/FP64 conversion
-* Comparison
-* `LOG2`
-* `EXP2`
-* `LN`
-* `EXP`
-* `SIN`
-* `COS`
-* `SIGMOID`
-* `TANH`
+- **Simulation:** the 12-test regression of this repository passes in the Vivado 2025.2 simulator. During development, the six lanes were checked against Berkeley SoftFloat 3e on 46.8 million transactions in all five rounding modes, including TestFloat level 2 cases.
+- **Timing and resources:** the routed KR260 design meets timing at 100 MHz (WNS +0.114 ns, WHS +0.010 ns) and uses 20,665 LUTs (17.6 %), 16,385 flip-flops (7.0 %), 10 DSP48E2 and 3 block RAM tiles, including the AXI DMA and interconnect.
+- **Board:** 584,212 operations through AXI DMA on a KR260 with zero result or flag mismatches, covering every operation and rounding mode.
 
-Example exact results include:
+This is bounded testing against a reference, not an exhaustive proof over all binary64 inputs and not a formal IEEE 754 certification.
 
-```text
-ADD  (1.5 + 2.5) : 4010000000000000
-SUB  (5.0 - 3.0) : 4000000000000000
-MUL  (2.0 * 3.0) : 4018000000000000
-DIV  (6.0 / 2.0) : 4008000000000000
-SQRT (sqrt(4.0)) : 4000000000000000
+## Credits
 
-I2F  (Integer 3) : 4008000000000000
-F2I  (Double 3.0): 0000000000000003
-
-FEQ  (2.0 == 2.0): 0000000000000001
-FLT  (2.0 < 3.0) : 0000000000000001
-
-LOG2 (8.0)       : 4008000000000000
-EXP2 (3.0)       : 4020000000000000
-
-SIN  (0.0)       : 0000000000000000
-COS  (0.0)       : 3ff0000000000000
-
-SIGMOID (0.0)    : 3fe0000000000000
-TANH    (0.0)    : 0000000000000000
-```
-
-Fractional transcendental cases have also been evaluated. Their results demonstrate functional behavior, although some remain approximate due to the current polynomial implementations.
-
-See the complete simulation output in:
-
-[`docs/tb_result.md`](docs/tb_result.md)
-
----
-
-# FPGA Hardware Validation
-
-The FPU has additionally been validated on actual FPGA hardware using a **Kria KV260** platform.
-
-The FPGA system uses:
-
-```text
-Python / PYNQ
-      │
-      ▼
-AXI-Lite
-      │
-      ├── FPU operation
-      └── function selector
-      │
-      ▼
-VRM FPU AXI Core
-      │
-      │ AXI-Stream
-      ▼
-AXI DMA
-      │
-      ▼
-FP64 FPU Hardware
-      │
-      ▼
-FPGA Result
-```
-
-The host-side validation program uses PYNQ to load the FPGA bitstream, configure the FPU through AXI-Lite registers, and transfer FP64 operands through AXI DMA.
-
-The hardware interface is exercised through a single-operation function:
-
-```python
-fpu_calc(op_a, op_b, fpu_op, funct3)
-```
-
-This provides a simple software-to-hardware interface for issuing individual FPU operations.
-
----
-
-## FPGA Demonstration
-
-The hardware validation was extended beyond individual primitives into multi-pass mathematical functions.
-
-Validated hardware demonstrations include:
-
-### Basic Operations
-
-```text
-ADD
-SUB
-MUL
-DIV
-SQRT
-```
-
-### Transcendental Operations
-
-```text
-EXP
-LN
-LOG2
-SIN
-COS
-```
-
-### Micro-Operation Composition
-
-```text
-x^y
-tan(x)
-log10(x)
-GELU(x)
-```
-
-For example:
-
-```text
-x^y
- │
- ├── LOG2(x)
- │
- ├── y × LOG2(x)
- │
- └── EXP2(...)
-          │
-          ▼
-         x^y
-```
-
-And:
-
-```text
-GELU(x)
- │
- ├── x²
- ├── x³
- ├── 0.044715 × x³
- ├── x + term
- ├── √(2/π) × term
- ├── TANH(...)
- ├── 1 + TANH(...)
- ├── 0.5 × x
- └── final multiplication
-          │
-          ▼
-       GELU(x)
-```
-
-This demonstrates the FPU as a reusable hardware mathematical engine rather than merely a collection of isolated operators.
-
----
-
-# FPGA Platform
-
-The current hardware validation environment is based on:
-
-| Component             | Platform              |
-| --------------------- | --------------------- |
-| FPGA Board            | AMD/Xilinx Kria KV260 |
-| Host Framework        | PYNQ                  |
-| Control               | AXI-Lite              |
-| Data Transfer         | AXI DMA               |
-| Floating-Point Format | IEEE 754 FP64         |
-| HDL                   | Verilog/SystemVerilog |
-
-The Python application runs on the Kria processing system and communicates with the programmable logic containing the FPU accelerator.
-
----
-
-# Repository Structure
-
-```text
-VRM21-FPU-Series/
-│
-├── rtl/
-│   ├── vrm_fpu_axi.v
-│   ├── vrm_fpu_add_sub_64.v
-│   ├── vrm_fpu_mul_64.v
-│   ├── vrm_fpu_div_64.v
-│   ├── vrm_fpu_sqrt_64.v
-│   ├── vrm_fpu_conv_64.v
-│   ├── vrm_fpu_misc_64.v
-│   ├── vrm_fpu_log2_64.v
-│   ├── vrm_fpu_ln_64.v
-│   ├── vrm_fpu_exp2_64.v
-│   ├── vrm_fpu_exp_64.v
-│   ├── vrm_fpu_sigmoid_64.v
-│   ├── vrm_fpu_tanh_64.v
-│   ├── vrm_fpu_sin_64.v
-│   ├── vrm_fpu_cos_64.v
-│   └── ...
-│
-├── tb/
-│   └── tb_vrm_fpu_axi.v
-│
-├── docs/
-│   ├── architecture.md
-│   ├── module_overview.md
-│   ├── interface.md
-│   ├── numerical_implementation.md
-│   ├── tb_result.md
-│   └── limitations.md
-│
-└── README.md
-```
-
-The exact repository structure may evolve as additional FPU modules are integrated.
-
----
-
-# Interface Overview
-
-The primary accelerator interface consists of:
-
-### AXI-Lite
-
-Used for configuring the operation:
-
-```text
-Register 0x08
-    FPU operation selector
-
-Register 0x0C
-    Function selector / funct3
-```
-
-### AXI-Stream
-
-Used for transferring floating-point operands and results.
-
-For binary operations:
-
-```text
-Input Stream:
-
-    Operand A
-       │
-       ▼
-    Operand B
-       │
-      TLAST
-       │
-       ▼
-    FPU Core
-       │
-       ▼
-    Result Stream
-```
-
-AXI DMA can be used to transfer operand and result buffers between the processing system and programmable logic.
-
-More details:
-
-[`docs/interface.md`](docs/interface.md)
-
----
-
-# Design Philosophy
-
-The project is structured around several principles:
-
-### Modular
-
-Each mathematical operation is implemented as an independent hardware block whenever practical.
-
-### Reusable
-
-Lower-level arithmetic units can be reused by higher-level mathematical functions.
-
-### Hardware-Oriented
-
-The implementations prioritize synthesizable RTL structures and FPGA-compatible datapaths.
-
-### Composable
-
-Complex functions can be constructed from simpler FPU operations.
-
-### Verifiable
-
-The same hardware interface can be exercised from both RTL simulation and an embedded FPGA software environment.
-
----
-
-# Current Verification Status
-
-| Function | RTL Simulation | FPGA Validation |
-| -------- | :------------: | :-------------: |
-| ADD      |        ✓       |        ✓        |
-| SUB      |        ✓       |        ✓        |
-| MUL      |        ✓       |        ✓        |
-| DIV      |        ✓       |        ✓        |
-| SQRT     |        ✓       |        ✓        |
-| I2F      |        ✓       |        —        |
-| F2I      |        ✓       |        —        |
-| FEQ      |        ✓       |        —        |
-| FLT      |        ✓       |        —        |
-| FLE      |   Implemented  |        —        |
-| FMIN     |        ✓       |        —        |
-| FMAX     |   Implemented  |        —        |
-| FCLASS   |   Implemented  |        —        |
-| LOG2     |        ✓       |        ✓        |
-| LN       |        ✓       |        ✓        |
-| EXP2     |        ✓       |        ✓        |
-| EXP      |        ✓       |        ✓        |
-| SIN      |        ✓       |        ✓        |
-| COS      |        ✓       |        ✓        |
-| SIGMOID  |        ✓       |   Implemented   |
-| TANH     |        ✓       |        ✓        |
-| POW      |        —       |        ✓        |
-| TAN      |        —       |        ✓        |
-| LOG10    |        —       |        ✓        |
-| GELU     |        —       |        ✓        |
-
-A check mark in the FPGA column indicates that the function has been exercised through the hardware accelerator environment. It does not imply exhaustive numerical validation across the complete IEEE 754 input space.
-
----
-
-# Limitations
-
-The current implementation should be considered a hardware research/development implementation rather than a fully IEEE 754-compliant commercial FPU.
-
-Known limitations include:
-
-* Transcendental functions use numerical approximations.
-* Numerical accuracy varies with the input range.
-* Some functions require range reduction performed by the software layer.
-* Exceptional IEEE 754 cases are not necessarily handled identically to a commercial CPU FPU.
-* FPGA validation currently covers selected functional cases rather than exhaustive testing.
-* Resource utilization and timing characteristics are FPGA-device dependent.
-* Higher-level functions such as `pow`, `tan`, `log10`, and `GELU` are currently demonstrated through composition of existing hardware primitives.
-
-Further details:
-
-[`docs/limitations.md`](docs/limitations.md)
-
----
-
-# Documentation
-
-| Document                                                          | Description                              |
-| ----------------------------------------------------------------- | ---------------------------------------- |
-| [`architecture.md`](docs/architecture.md)                         | Overall FPU architecture                 |
-| [`module_overview.md`](docs/module_overview.md)                   | Module and function overview             |
-| [`interface.md`](docs/interface.md)                               | AXI and module interfaces                |
-| [`numerical_implementation.md`](docs/numerical_implementation.md) | Numerical approximation techniques       |
-| [`tb_result.md`](docs/tb_result.md)                               | RTL simulation results                   |
-| [`limitations.md`](docs/limitations.md)                           | Known limitations and verification scope |
-
----
-
-# Example Software Flow
-
-A typical FPGA application follows:
-
-```text
-1. Load FPGA bitstream
-        │
-        ▼
-2. Access VRM FPU AXI peripheral
-        │
-        ▼
-3. Configure FPU operation
-        │
-        ▼
-4. Prepare FP64 operands
-        │
-        ▼
-5. Transfer operands using AXI DMA
-        │
-        ▼
-6. Execute hardware operation
-        │
-        ▼
-7. Receive FP64 result
-        │
-        ▼
-8. Process / display result
-```
-
-The current PYNQ demonstration additionally provides a command-line calculator capable of exposing the hardware accelerator through common mathematical operations.
-
----
-
-# Project Status
-
-**Status: Active Development**
-
-The current release represents a functional FP64 FPGA FPU platform with:
-
-* RTL implementation
-* AXI-based hardware interface
-* RTL simulation baseline
-* FPGA hardware validation
-* Transcendental function support
-* Activation function support
-* Higher-level mathematical function composition
-
-Future development may focus on improving numerical accuracy, expanding IEEE 754 special-case handling, optimizing FPGA resource utilization, improving throughput/latency, and extending the supported mathematical function set.
-
----
+Expected results in `tb/mem/` were generated with [Berkeley SoftFloat 3e](https://github.com/ucb-bar/berkeley-softfloat-3) and [Berkeley TestFloat 3e](https://github.com/ucb-bar/berkeley-testfloat-3) by John R. Hauser, copyright The Regents of the University of California, BSD 3-Clause license. Neither tool is included in this repository, and no endorsement is implied. `rtl/vrm_fpu_record_fifo.v` is adapted from [VRM21-RTL-Utilities](https://github.com/VRM21-Studios/VRM21-RTL-Utilities) (MIT) and keeps its notice.
 
 ## License
 
-Licensed under the MIT License.
-Provided as-is, without warranty.
-
----
-
-## Author
-
-**VRM21-Studios**
-
-Hardware architecture, RTL implementation, verification, and FPGA integration developed as part of the VRM21 hardware acceleration projects.
+MIT; see [LICENSE](LICENSE). The license covers the source code. A bitstream built from it is not distributed with this repository; if you distribute one, it contains AMD IP (Zynq PS, AXI DMA, SmartConnect) subject to the AMD license terms of your Vivado installation.
